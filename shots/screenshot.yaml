@@ -1,0 +1,10 @@
+# ModeUpdate supplies the session theme. The first frame is Find, before permission.
+name: screenshot
+plugin: ../target/wasm32-wasip1/release/plugin.wasm
+geometry:
+  rows: 18
+  cols: 72
+steps:
+  - action: mode_update
+    mode: normal
+    session: demo

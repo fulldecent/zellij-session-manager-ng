@@ -1,0 +1,12 @@
+[package]
+name = "plugin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["William Entriken"]
+description = "Zellij Session Manager: find a session, attach to it, or start one from a layout."
+repository = "https://github.com/fulldecent/zellij-session-manager-ng"
+
+[dependencies]
+unicode-width = "0.2"
+zellij-tile = "0.45.1"
