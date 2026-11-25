@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.0](https://github.com/fulldecent/zellij-session-manager-ng/compare/v0.0.0...v0.1.0) (2026-11-25)
+
+
+### Features
+
+* show sessions in a theme-colored table ([c516e75](https://github.com/fulldecent/zellij-session-manager-ng/commit/c516e75869d0ea0215860abe03ab193483ff3320))
+
+## Changelog
+
 ## Unreleased
 
 - Find lists running sessions and saved sessions.
