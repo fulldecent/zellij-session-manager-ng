@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::time::Duration;
 
 use zellij_tile::prelude::*;
 
@@ -83,7 +84,6 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::PermissionRequestResult,
             EventType::SessionUpdate,
-            EventType::Timer,
         ]);
         set_selectable(true);
         self.sync();
@@ -97,7 +97,6 @@ impl ZellijPlugin for State {
                     self.notice = None;
                 }
                 self.refresh();
-                set_timeout(1.0);
                 true
             }
             Event::PermissionRequestResult(_) => {
@@ -114,13 +113,7 @@ impl ZellijPlugin for State {
                     true
                 }
             }
-            Event::SessionUpdate(..) | Event::Timer(_) => {
-                if matches!(event, Event::Timer(_)) {
-                    set_timeout(1.0);
-                }
-                self.refresh();
-                true
-            }
+            Event::SessionUpdate(live, exited) => self.apply_sessions(live, exited),
             Event::Key(key) => self.on_key(&key),
             Event::Mouse(mouse) => self.on_mouse(mouse),
             _ => false,
@@ -188,6 +181,13 @@ impl ZellijPlugin for State {
         print!("\u{1b}[?7l");
         for (y, line) in frame.lines.iter().enumerate() {
             print!("\u{1b}[{};1H{line}", y + 1);
+        }
+        for (text, x, y) in frame.overlay {
+            print_text_with_coordinates(text, x, y, Some(cols), None);
+        }
+        if let Some(table) = frame.table {
+            let (x, y, width, height) = frame.table_at;
+            print_table_with_coordinates(table, x, y, Some(width), Some(height));
         }
         print!("\u{1b}[?7h");
         let _ = io::stdout().flush();
@@ -462,15 +462,25 @@ impl State {
     }
 
     fn complete_query(&mut self) {
-        let index = self.selected.unwrap_or(0);
-        if let Some(name) = self
+        let index = self.selected.unwrap_or_else(|| {
+            self.found
+                .iter()
+                .position(|found| !self.sessions[found.index].current)
+                .unwrap_or(0)
+        });
+        let Some(name) = self
             .found
             .get(index)
             .map(|found| self.sessions[found.index].name.clone())
-        {
-            self.query.set(name);
-            self.selected = None;
-        }
+        else {
+            return;
+        };
+        self.query.set(name.clone());
+        self.sync();
+        self.selected = self
+            .found
+            .iter()
+            .position(|found| self.sessions[found.index].name == name);
     }
 
     fn attach_or_create(&mut self) {
@@ -626,7 +636,13 @@ impl State {
         if !self.require_change() {
             return;
         }
-        self.notice = save_session().err();
+        self.notice = match save_session() {
+            Ok(()) => Some(
+                "Saved this session. After it exits, it stays in the list and ENTER resurrects it."
+                    .to_string(),
+            ),
+            Err(error) => Some(error),
+        };
     }
 
     fn refresh(&mut self) {
@@ -636,42 +652,58 @@ impl State {
         let Ok(snapshot) = get_session_list() else {
             return;
         };
-        if let Some(current) = snapshot
-            .live_sessions
-            .iter()
-            .find(|session| session.is_current_session)
-        {
+        self.apply_sessions(snapshot.live_sessions, snapshot.resurrectable_sessions);
+    }
+
+    /// `SessionUpdate` already carries the list. Applying that payload avoids a
+    /// second `get_session_list` round trip, which copies every pane manifest.
+    fn apply_sessions(&mut self, live: Vec<SessionInfo>, exited: Vec<(String, Duration)>) -> bool {
+        let mut layouts_changed = false;
+        if let Some(current) = live.iter().find(|session| session.is_current_session) {
             self.current_name = Some(current.name.clone());
-            self.layouts = current.available_layouts.clone();
+            let labels: Vec<String> = current.available_layouts.iter().map(layout_label).collect();
+            let previous: Vec<String> = self.layouts.iter().map(layout_label).collect();
+            if labels != previous {
+                self.layouts = current.available_layouts.clone();
+                layouts_changed = true;
+            }
         }
-        let mut sessions: Vec<Session> = snapshot
-            .live_sessions
+        let mut sessions: Vec<Session> = live
             .into_iter()
             .map(|session| Session {
                 name: session.name,
                 kind: Kind::Running,
                 current: session.is_current_session,
                 clients: session.connected_clients,
-                tabs: session.tabs.len(),
+                panes: session
+                    .panes
+                    .panes
+                    .values()
+                    .map(|panes| {
+                        panes
+                            .iter()
+                            .filter(|pane| pane.is_selectable && !pane.is_suppressed)
+                            .count()
+                    })
+                    .sum(),
                 age: session.creation_time,
             })
             .collect();
-        sessions.extend(
-            snapshot
-                .resurrectable_sessions
-                .into_iter()
-                .map(|(name, age)| Session {
-                    name,
-                    kind: Kind::Exited,
-                    current: false,
-                    clients: 0,
-                    tabs: 0,
-                    age,
-                }),
-        );
+        sessions.extend(exited.into_iter().map(|(name, age)| Session {
+            name,
+            kind: Kind::Exited,
+            current: false,
+            clients: 0,
+            panes: 0,
+            age,
+        }));
         sort_sessions(&mut sessions);
+        if sessions_match(&self.sessions, &sessions) && !layouts_changed {
+            return false;
+        }
         self.sessions = sessions;
         self.sync();
+        true
     }
 
     fn sync(&mut self) {
@@ -771,6 +803,18 @@ impl State {
     }
 }
 
+fn sessions_match(current: &[Session], next: &[Session]) -> bool {
+    current.len() == next.len()
+        && current.iter().zip(next).all(|(left, right)| {
+            left.name == right.name
+                && left.kind == right.kind
+                && left.current == right.current
+                && left.clients == right.clients
+                && left.panes == right.panes
+                && left.age.as_secs() == right.age.as_secs()
+        })
+}
+
 fn name_error(name: &str) -> Option<String> {
     if name.is_empty() {
         Some("The session name cannot be empty.".to_string())
@@ -811,6 +855,38 @@ mod tests {
         let state = State::default();
         assert!(state.finding);
         assert_eq!(state.border_title(), "Sessions > Find");
+    }
+
+    #[test]
+    fn tab_picks_the_first_other_session_when_none_is_selected() {
+        use std::time::Duration;
+
+        let mut state = State {
+            sessions: vec![
+                Session {
+                    name: "here".into(),
+                    kind: Kind::Running,
+                    current: true,
+                    clients: 1,
+                    panes: 1,
+                    age: Duration::from_secs(1),
+                },
+                Session {
+                    name: "other".into(),
+                    kind: Kind::Running,
+                    current: false,
+                    clients: 1,
+                    panes: 1,
+                    age: Duration::from_secs(2),
+                },
+            ],
+            ..State::default()
+        };
+        state.sync();
+        state.selected = None;
+        state.complete_query();
+        assert_eq!(state.query.text(), "other");
+        assert!(state.selected.is_some());
     }
 
     #[test]

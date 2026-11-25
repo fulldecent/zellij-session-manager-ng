@@ -1,10 +1,11 @@
 //! The session list, the new-session layout list, rename, and the kill-all question.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use zellij_tile::prelude::{Table, Text};
 
 use crate::chrome::{Chrome, Ink};
 use crate::controls::{paint_row, Click, Piece};
-use crate::model::{detail, Found, Session};
+use crate::model::{age_label, Found, Kind, Session};
 
 pub struct Hit {
     pub y: usize,
@@ -17,6 +18,9 @@ pub struct Frame {
     pub lines: Vec<String>,
     pub hits: Vec<Hit>,
     pub cursor: Option<(usize, usize)>,
+    pub table: Option<Table>,
+    pub table_at: (usize, usize, usize, usize),
+    pub overlay: Vec<(Text, usize, usize)>,
 }
 
 pub struct Pointer {
@@ -45,37 +49,28 @@ pub fn paint_list(
     let mut hits = Vec::new();
     let mut cursor = None;
     if rows == 0 || cols == 0 {
-        return Frame {
-            lines,
-            hits,
-            cursor,
-        };
+        return empty_frame(lines, hits, cursor);
     }
+    let mut overlay = Vec::new();
     let bars = list_bars(view.finding);
     let footer = bars.len().min(rows);
     let mut y = 0usize;
-    if view.notice.is_some() && y < rows.saturating_sub(footer) {
-        put(
-            &mut lines,
-            y,
-            body_line(view.notice.unwrap_or(""), cols, chrome),
-        );
-        y += 1;
+    if let Some(notice) = view.notice {
+        if y < rows.saturating_sub(footer) {
+            overlay.push((Text::new(notice).color_range(3, ..), 0, y));
+            put(&mut lines, y, clear_line());
+            y += 1;
+        }
     }
     if y < rows.saturating_sub(footer) {
         let prompt = "Find: ";
         let typed: String = view.query.chars().take(view.cursor).collect();
         let cursor_x = UnicodeWidthStr::width(prompt) + UnicodeWidthStr::width(typed.as_str());
-        put(
-            &mut lines,
-            y,
-            colored(
-                &format!("{prompt}{}", view.query),
-                cols,
-                chrome.light,
-                chrome.bar,
-            ),
-        );
+        let find = Text::new(format!("{prompt}{}_", view.query))
+            .color_range(2, 0..prompt.len())
+            .color_range(1, prompt.len()..);
+        overlay.push((find, 0, y));
+        put(&mut lines, y, clear_line());
         if view.finding {
             cursor = Some((cursor_x.min(cols.saturating_sub(1)), y));
         }
@@ -84,32 +79,33 @@ pub fn paint_list(
     let body_top = y + 1;
     let body_height = rows.saturating_sub(footer).saturating_sub(body_top);
     let start = window(view.found.len(), view.selected.unwrap_or(0), body_height);
+    let mut table = Table::new();
+    let mut painted = 0usize;
     for slot in 0..body_height {
         let row_y = body_top + slot;
+        put(&mut lines, row_y, clear_line());
         let Some(found) = view.found.get(start + slot) else {
-            put(&mut lines, row_y, body_line("", cols, chrome));
             continue;
         };
         let session = &view.sessions[found.index];
         let selected = view.selected == Some(start + slot);
-        let hover = pointer.y == Some(row_y) && !selected;
-        put(
-            &mut lines,
-            row_y,
-            session_line(session, &found.hits, selected, hover, chrome, cols),
-        );
+        table = table.add_styled_row(session_row(session, &found.hits, selected));
         hits.push(Hit {
             y: row_y,
             x0: 0,
             x1: cols,
             click: Click::Row(start + slot),
         });
+        painted += 1;
     }
     place_bars(&mut lines, &mut hits, &bars, rows, cols, chrome, &pointer);
     Frame {
         lines,
         hits,
         cursor,
+        table: if painted == 0 { None } else { Some(table) },
+        table_at: (0, body_top, cols, body_height),
+        overlay,
     }
 }
 
@@ -128,11 +124,7 @@ pub fn paint_page(
     let mut hits = Vec::new();
     let mut cursor = None;
     if rows == 0 || cols == 0 {
-        return Frame {
-            lines,
-            hits,
-            cursor,
-        };
+        return empty_frame(lines, hits, cursor);
     }
     let footer = bars.len().min(rows);
     let mut y = 0usize;
@@ -180,6 +172,9 @@ pub fn paint_page(
         lines,
         hits,
         cursor,
+        table: None,
+        table_at: (0, 0, 0, 0),
+        overlay: Vec::new(),
     }
 }
 
@@ -277,51 +272,73 @@ fn place_bars(
     }
 }
 
-fn session_line(
-    session: &Session,
-    hits: &[usize],
-    selected: bool,
-    hover: bool,
-    chrome: &Chrome,
-    cols: usize,
-) -> String {
-    let meta = detail(session);
-    let meta_width = UnicodeWidthStr::width(meta.as_str());
-    let name_cols = cols.saturating_sub(meta_width + 1);
-    let name = truncate(&session.name, name_cols);
+fn session_row(session: &Session, hits: &[usize], selected: bool) -> Vec<Text> {
+    let mut name = Text::new(session.name.clone()).color_range(1, ..);
+    if !hits.is_empty() {
+        name = name.color_indices(3, hits.to_vec());
+    }
+    let (details_text, ranges) = session_details(session);
+    let mut details = Text::new(details_text);
+    for range in ranges {
+        details = details.color_range(2, range);
+    }
+    let tag = Text::new(session_tag(session)).color_range(0, ..);
     if selected {
-        let mut text = name;
-        let pad = name_cols.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-        text.push_str(&" ".repeat(pad));
-        if meta_width > 0 && cols > meta_width {
-            text.push(' ');
-            text.push_str(&meta);
+        vec![name.selected(), details.selected(), tag.selected()]
+    } else {
+        vec![name, details, tag]
+    }
+}
+
+fn session_details(session: &Session) -> (String, Vec<std::ops::Range<usize>>) {
+    match session.kind {
+        Kind::Running => {
+            let panes = session.panes.to_string();
+            let clients = session.clients.to_string();
+            let word = if session.clients == 1 {
+                "client"
+            } else {
+                "clients"
+            };
+            let text = format!("{panes} panes, {clients} {word}");
+            let pane_end = panes.len();
+            let client_start = pane_end + " panes, ".len();
+            (
+                text,
+                vec![0..pane_end, client_start..client_start + clients.len()],
+            )
         }
-        return colored(&text, cols, chrome.selected_fg, chrome.selected_bg);
-    }
-    let bg = if hover { chrome.hover } else { chrome.bar };
-    let mut out = String::from("\u{1b}[0m");
-    let mut used = 0usize;
-    for (index, ch) in name.chars().enumerate() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + width > name_cols {
-            break;
+        Kind::Exited => {
+            let age = age_label(session.age);
+            let text = format!("Created {age}");
+            let start = "Created ".len();
+            let ranges = std::iter::once(start..start + age.len()).collect();
+            (text, ranges)
         }
-        let ink = if hits.contains(&index) {
-            chrome.alt
-        } else {
-            chrome.light
-        };
-        out.push_str(&format!("\u{1b}[{};{}m{ch}", ink.fg(), bg.bg()));
-        used += width;
     }
-    if used < cols {
-        let between = cols - used - meta_width.min(cols - used);
-        let rest = format!("{}{meta}", " ".repeat(between));
-        out.push_str(&format!("\u{1b}[{};{}m{rest}", chrome.light.fg(), bg.bg()));
+}
+
+fn session_tag(session: &Session) -> &'static str {
+    match session.kind {
+        Kind::Running if session.current => "[CURRENT]",
+        Kind::Running => "[ATTACH]",
+        Kind::Exited => "[RESURRECT]",
     }
-    out.push_str("\u{1b}[0m");
-    out
+}
+
+fn clear_line() -> String {
+    "\u{1b}[0m\u{1b}[K".to_string()
+}
+
+fn empty_frame(lines: Vec<String>, hits: Vec<Hit>, cursor: Option<(usize, usize)>) -> Frame {
+    Frame {
+        lines,
+        hits,
+        cursor,
+        table: None,
+        table_at: (0, 0, 0, 0),
+        overlay: Vec::new(),
+    }
 }
 
 fn body_line(text: &str, cols: usize, chrome: &Chrome) -> String {
@@ -404,7 +421,7 @@ mod tests {
             .map(|line| visible(line))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Find:"));
+        assert!(!frame.overlay.is_empty());
         assert!(text.contains("ENTER Attach"));
         assert!(text.contains("ESC Clear"));
         assert!(!text.contains("Sessions"));

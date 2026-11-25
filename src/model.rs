@@ -14,7 +14,7 @@ pub struct Session {
     pub kind: Kind,
     pub current: bool,
     pub clients: usize,
-    pub tabs: usize,
+    pub panes: usize,
     pub age: Duration,
 }
 
@@ -57,22 +57,6 @@ pub fn age_label(age: Duration) -> String {
         format!("{}h ago", secs / 3_600)
     } else {
         format!("{}d ago", secs / 86_400)
-    }
-}
-
-pub fn detail(session: &Session) -> String {
-    match session.kind {
-        Kind::Running if session.current => format!("current  {} tabs", session.tabs),
-        Kind::Running => format!("{}  {} tabs", clients(session.clients), session.tabs),
-        Kind::Exited => format!("exited  {}", age_label(session.age)),
-    }
-}
-
-fn clients(count: usize) -> String {
-    if count == 1 {
-        "1 client".to_string()
-    } else {
-        format!("{count} clients")
     }
 }
 
@@ -159,7 +143,7 @@ mod tests {
             kind: Kind::Running,
             current,
             clients: 1,
-            tabs: 1,
+            panes: 1,
             age: Duration::from_secs(age_secs),
         }
     }
@@ -173,7 +157,7 @@ mod tests {
                 kind: Kind::Exited,
                 current: false,
                 clients: 0,
-                tabs: 0,
+                panes: 0,
                 age: Duration::from_secs(5),
             },
             running("here", true, 99),
